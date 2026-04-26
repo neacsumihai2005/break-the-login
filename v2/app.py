@@ -5,6 +5,7 @@ import datetime
 import bcrypt
 import uuid
 import os
+from functools import wraps
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
@@ -18,10 +19,10 @@ DB_NAME = "authx_db"
 DB_USER = "authx_user"
 DB_PASS = os.getenv('DB_PASSWORD')
 
-# cheie secreta pentru semnarea token-urilor JWT 
+# cheie secreta pentru semnarea token-urilor JWT
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 
-# memorie pentru rate limiting (se reseteaza la restartul serverului) 
+# memorie pentru rate limiting (se reseteaza la restartul serverului)
 failed_attempts = {}
 MAX_ATTEMPTS = 5
 
@@ -34,7 +35,7 @@ def get_db_connection():
     )
 
 def log_audit(user_id, action, resource="auth", ip_address=None):
-    """Functie pentru salvarea evenimentelor in tabelul audit_logs """
+    """Functie pentru salvarea evenimentelor in tabelul audit_logs"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -47,6 +48,24 @@ def log_audit(user_id, action, resource="auth", ip_address=None):
         conn.close()
     except Exception as e:
         print(f"[DEBUG] Eroare Audit Log: {e}")
+
+def role_required(allowed_roles):
+    """Decorator pentru verificarea rolului utilizatorului (RBAC)"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            token = request.cookies.get('authx_session')
+            if not token:
+                return jsonify({"status": "error", "message": "Neautorizat."}), 401
+            try:
+                data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+                if data.get('role') not in allowed_roles:
+                    return jsonify({"status": "error", "message": "Acces interzis: permisiuni insuficiente."}), 403
+                return f(data, *args, **kwargs)
+            except Exception as e:
+                return jsonify({"status": "error", "message": "Sesiune invalida."}), 401
+        return decorated_function
+    return decorator
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -70,7 +89,7 @@ def register():
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO users (email, password_hash, role) VALUES (%s, %s, %s) RETURNING id", 
-            (email, hashed_password, 'USER')
+            (email, hashed_password, 'USER') # default role
         )
         new_id = cur.fetchone()
         conn.commit()
@@ -100,11 +119,9 @@ def login():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # extragem datele utilizatorului
-        cur.execute("SELECT id, password_hash, locked FROM users WHERE email = %s", (email,))
+        # extragem si rolul utilizatorului
+        cur.execute("SELECT id, password_hash, locked, role FROM users WHERE email = %s", (email,))
         row = cur.fetchone()
-
-        #print(f"[DEBUG DB] Rand gasit pentru {email}: {row}")
 
         error_msg = "Credentiale invalide."
 
@@ -112,16 +129,14 @@ def login():
             log_audit(None, "LOGIN_FAIL_UNKNOWN_USER", ip_address=ip)
             return jsonify({"status": "error", "message": error_msg}), 401
         
-        # unpacking
-        # row este (id, password_hash, locked)
-        u_id, u_hash, u_locked = row
+        u_id, u_hash, u_locked, u_role = row
 
-        # verificam daca este blocat
+        # verificam daca este blocat (protectie Brute Force 4.3)
         if u_locked:
             log_audit(u_id, "LOGIN_ATTEMPT_LOCKED", ip_address=ip)
             return jsonify({"status": "error", "message": "Cont blocat."}), 403
 
-        # verificare parola
+        
         if not bcrypt.checkpw(password.encode('utf-8'), u_hash.encode('utf-8')):
             failed_attempts[email] = failed_attempts.get(email, 0) + 1
             log_audit(u_id, "LOGIN_FAIL_WRONG_PWD", ip_address=ip)
@@ -135,16 +150,19 @@ def login():
             conn.close()
             return jsonify({"status": "error", "message": error_msg}), 401
     
-        # resetare succes
+       
         failed_attempts[email] = 0
         log_audit(u_id, "LOGIN_SUCCESS", ip_address=ip)
         
+        # cream token JWT care include rolul
         token = jwt.encode({
             'user_id': u_id,
+            'role': u_role,
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
         }, app.config['SECRET_KEY'], algorithm='HS256')
 
-        response = make_response(jsonify({"status": "success", "message": "Login reusit!"}))
+        response = make_response(jsonify({"status": "success", "message": "Login reusit!", "role": u_role}))
+        # cookie securizat (HttpOnly, SameSite)
         response.set_cookie('authx_session', token, httponly=True, samesite='Lax')
         
         cur.close()
@@ -152,106 +170,71 @@ def login():
         return response, 200
         
     except Exception as e:
-        print(f"--- EROARE CRITICA LOGIN: {e} ---")
         return jsonify({"status": "error", "message": "Eroare server."}), 500
-        
 
-@app.route('/forgot-password', methods=['POST'])
-def forgot_password():
-    data = request.get_json()
-    email = data.get('email')
+@app.route('/tickets', methods=['GET'])
+@role_required(['USER', 'MANAGER'])
+def get_my_tickets(user_data):
+    """utilizatorii vad doar tichetele lor,
+    managerii vad tot in aceasta ruta sau in admin"""
     
-    # FIX 4.4: raspuns uniform pentru a preveni enumerarea 
-    msg = "Daca adresa exista, un token de resetare a fost trimis."
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE email = %s", (email,))
-    user = cur.fetchone()
-
-    if user:
-        # FIX 4.6: token impredictibil (UUID v4) 
-        token = str(uuid.uuid4())
-        log_audit(user, "PWD_RESET_TOKEN_GEN", ip_address=request.remote_addr)
-        cur.close()
-        conn.close()
-        return jsonify({"status": "success", "message": msg, "debug_token": token}), 200
-    
-    cur.close()
-    conn.close()
-    return jsonify({"status": "success", "message": msg}), 200
-
-@app.route('/reset-password', methods=['POST'])
-def reset_password():
-    data = request.get_json()
-    email = data.get('email')
-    token = data.get('token')
-    new_pwd = data.get('new_password')
-
-    if not email or not token or not new_pwd or len(new_pwd) < 8:
-        return jsonify({"status": "error", "message": "Date invalide sau parola prea scurta."}), 400
-
     try:
-        hashed = bcrypt.hashpw(new_pwd.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        logged_user_id = user_data.get('user_id')
         conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET password_hash = %s WHERE email = %s RETURNING id", (hashed, email))
-        user = cur.fetchone()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # protectie IDOR (4.6): filtrare stricta dupa owner_id
+        query = "SELECT id, title, description, status, severity FROM tickets WHERE owner_id = %s"
+        cur.execute(query, (logged_user_id,))
         
-        if user:
-            conn.commit()
-            log_audit(user, "PWD_RESET_SUCCESS", ip_address=request.remote_addr)
-            cur.close()
-            conn.close()
-            return jsonify({"status": "success", "message": "Parola a fost actualizata!"})
+        tickets = cur.fetchall()
+        log_audit(logged_user_id, "VIEW_TICKETS", resource="tickets", ip_address=request.remote_addr)
         
         cur.close()
         conn.close()
-        return jsonify({"status": "error", "message": "Eroare resetare."}), 400
+        return jsonify({"status": "success", "data": tickets}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Eroare server."}), 500
+
+@app.route('/admin/tickets', methods=['GET'])
+@role_required(['MANAGER'])
+def get_all_tickets_admin(user_data):
+    """endpoint exclusiv Manager: vizualizarea tuturor tichetelor din sistem"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM tickets") # fara filtrare owner_id
+        tickets = cur.fetchall()
+        
+        log_audit(user_data.get('user_id'), "ADMIN_VIEW_ALL_TICKETS", resource="admin_tickets", ip_address=request.remote_addr)
+        
+        cur.close()
+        conn.close()
+        return jsonify({"status": "success", "data": tickets}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/admin/audit', methods=['GET'])
+@role_required(['MANAGER'])
+def view_audit_logs(user_data):
+    """endpoint exclusiv Manager: vizualizarea log-urilor de audit"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM audit_logs ORDER BY timestamp DESC")
+        logs = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"status": "success", "audit_data": logs}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": "Eroare server."}), 500
 
 @app.route('/logout', methods=['POST'])
 def logout():
-    # FIX 4.5: invalidarea sesiunii prin stergerea cookie-ului 
+    """sterg cookie-ul si invalidez sesiunea"""
     response = make_response(jsonify({"status": "success", "message": "Delogare reusita."}))
     response.set_cookie('authx_session', '', expires=0, httponly=True)
     return response, 200
-    
-@app.route('/tickets', methods=['GET'])
-def get_my_tickets():
-    token = request.cookies.get('authx_session')
-    if not token:
-        return jsonify({"status": "error", "message": "Neautorizat."}), 401
 
-    try:
-        data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        
-        # ne asiguram ca luam ID-ul corect din JWT
-        logged_user_id = data.get('user_id')
-        if isinstance(logged_user_id, (list, tuple)):
-            logged_user_id = logged_user_id
-
-        conn = get_db_connection()
-        # folosim RealDictCursor pentru mapare automata
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        query = "SELECT id, title, description, status, severity FROM tickets WHERE owner_id = %s"
-        cur.execute(query, (logged_user_id,))
-        
-        tickets = cur.fetchall()
-        
-        log_audit(logged_user_id, "VIEW_TICKETS", resource="tickets", ip_address=request.remote_addr)
-        
-        cur.close()
-        conn.close()
-
-        # trimitem direct 'tickets' in JSON
-        return jsonify({"status": "success", "data": tickets}), 200
-
-    except Exception as e:
-        print(f"--- EROARE FINALA TICKETS: {e} ---")
-        return jsonify({"status": "error", "message": "Eroare server."}), 500
-                
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
