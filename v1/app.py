@@ -5,11 +5,11 @@ import datetime
 
 app = Flask(__name__)
 
-# Configurația bazei de date
+# configuratia bazei de date
 DB_HOST = "localhost"
 DB_NAME = "authx_db"
 DB_USER = "authx_user"
-DB_PASS = "123"  # INSEREAZĂ PAROLA TA AICI
+DB_PASS = "123"  # INSEREAZA PAROLA TA AICI
 
 #o cheie se creta slaba
 app.config['SECRET_KEY'] = 'secret123'
@@ -21,6 +21,49 @@ def get_db_connection():
         user=DB_USER,
         password=DB_PASS
     )
+
+@app.route('/tickets/all', methods=['GET'])
+def get_all_tickets_vulnerable():
+    """VULNERABILITATE: Returneaza toate tichetele din sistem oricui e logat"""
+    token = request.cookies.get('authx_session')
+    if not token:
+        return jsonify({"status": "error", "message": "Neautorizat"}), 401
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # nu filtram deloc dupa owner_id
+        cur.execute("SELECT * FROM tickets")
+        tickets = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"status": "success", "all_system_data": tickets}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/ticket/<int:ticket_id>', methods=['GET'])
+def get_ticket_by_id_idor(ticket_id):
+    """VULNERABILITATE: IDOR Critic. Poti vedea orice tichet doar schimband ID-ul in URL"""
+    token = request.cookies.get('authx_session')
+    if not token:
+        return jsonify({"status": "error", "message": "Logati-va intai"}), 401
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # luam tichetul doar dupa ID-ul din URL 
+        # nu verificam daca owner_id din tabel corespunde cu user_id din token
+        cur.execute("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
+        ticket = cur.fetchone()
+        
+        cur.close()
+        conn.close()
+        
+        if ticket:
+            return jsonify({"status": "success", "ticket_data": ticket}), 200
+        return jsonify({"status": "error", "message": "Nu exista"}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -36,7 +79,7 @@ def register():
     role = 'USER' 
 
     try:
-        print("[DEBUG] Mă conectez la DB...")
+        print("[DEBUG] Ma conectez la DB...")
         conn = get_db_connection()
         cur = conn.cursor()
         
@@ -45,7 +88,7 @@ def register():
         print("[DEBUG] Execut query-ul...")
         cur.execute(insert_query, (email, password, role))
         
-        print(f"[DEBUG] Rânduri afectate în memorie: {cur.rowcount}")
+        print(f"[DEBUG] Randuri afectate in memorie: {cur.rowcount}")
         
         conn.commit()
         print("[DEBUG] COMMIT executat cu succes pe baza de date!")
@@ -56,7 +99,7 @@ def register():
         return jsonify({"status": "success", "message": "Cont creat cu succes!"}), 201
 
     except Exception as e:
-        print(f"[DEBUG] !!! EROARE CRITICĂ !!! : {e}")
+        print(f"[DEBUG] !!! EROARE CRITICA !!! : {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -74,7 +117,7 @@ def login():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        #cautam utilizatorul in baza de date
+        # cautam utilizatorul in baza de date
         cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (email,))
         user = cur.fetchone()
 
@@ -83,7 +126,7 @@ def login():
             conn.close()
             return jsonify({"status": "error", "message": "Utilizatorul nu exista!"}), 404
         
-        #verificam parola
+        # verificam parola
         stored_password = user[1]
 
         if password != stored_password:
@@ -91,9 +134,9 @@ def login():
             conn.close()
             return jsonify({"status": "error", "message": "Parola incorecta!"}), 401
     
-        #daca ajungem aici, parola e corecta
+        # daca ajungem aici, parola e corecta
         
-        #cream o sesiune vulnerabila
+        # cream o sesiune vulnerabila
 
         #1. cream un token JWT care expira peste 10 ani
         token = jwt.encode({
@@ -170,15 +213,14 @@ def reset_password():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- ENDPOINT LOGOUT V1 (Vulnerabil) ---
 @app.route('/logout', methods=['POST'])
 def logout():
-    # VULNERABILITATE: Ștergem cookie-ul doar din browser.
-    # Backend-ul nu invalidează token-ul JWT (nu avem blacklist).
-    # Dacă a fost furat, va fi valid încă 10 ani!
-    response = make_response(jsonify({"status": "success", "message": "Delogare realizată local."}))
+    # stergem cookie-ul doar din browser.
+    # backend-ul nu invalideaza token-ul JWT (nu avem blacklist). in fine, nici la v2 n-avem dar tot e secure pt ca expira intr-o ora si e greu de furat din start pt ca avem HttpOnly = True acolo
+    # daca a fost furat, va fi valid inca 10 ani!
+    response = make_response(jsonify({"status": "success", "message": "Delogare realizata local."}))
     
-    # Suprascriem cookie-ul cu unul gol care expiră instant
+    # suprascriem cookie-ul cu unul gol care expira instant
     response.set_cookie('authx_session', '', expires=0)
     
     return response, 200
