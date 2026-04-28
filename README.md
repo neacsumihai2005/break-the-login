@@ -1,3 +1,5 @@
+link prezentare: https://www.youtube.com/watch?v=_dVQsZ2s5hc
+
 # AuthX: Sistem Securizat de Autentificare & Management al Tichetelor
 
 AuthX este un proiect demonstrativ conceput pentru a prezenta evoluția practicilor de securitate web. Acesta constă în două versiuni ale unei aplicații bazate pe Flask: **v1**, care este construită intenționat cu numeroase vulnerabilități critice în scopuri educaționale, și **v2**, care implementează măsuri de securitate la standarde industriale pentru a atenua acele riscuri.
