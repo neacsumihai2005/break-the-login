@@ -236,5 +236,98 @@ def logout():
     response.set_cookie('authx_session', '', expires=0, httponly=True)
     return response, 200
 
+@app.route('/forgot-password', methods=['POST'])
+def forgot_password():
+    """V2 Securizat: Generare token JWT scurt (15 minute) si prevenire User Enumeration"""
+    data = request.get_json()
+    email = data.get('email')
+
+    if not email:
+        return jsonify({"status": "error", "message": "Email necesar"}), 400
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+
+        # FIX: Prevenirea User Enumeration - Returnam acelasi mesaj si daca userul exista si daca nu
+        generic_message = "Daca email-ul exista in sistem, a fost generat un link de resetare."
+        
+        reset_token = None
+        if user:
+            user_id = user
+            # FIX: Generam un token JWT criptografic, valabil doar 15 minute
+            reset_token = jwt.encode({
+                'reset_user_id': user_id,
+                'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+            }, app.config['SECRET_KEY'], algorithm='HS256')
+            
+            log_audit(user_id, "PASSWORD_RESET_REQUESTED", ip_address=request.remote_addr)
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "status": "success",
+            "message": generic_message,
+            # [DEBUG/PoC]: In productie, token-ul se trimite pe email. Pentru demonstratie, il returnam in raspuns.
+            "debug_token": reset_token
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Eroare server."}), 500
+
+@app.route('/reset-password', methods=['POST'])
+def reset_password():
+    """V2 Securizat: Validare stricta token si aplicare politica de parole"""
+    data = request.get_json()
+    token = data.get('token')
+    new_password = data.get('new_password')
+
+    if not token or not new_password:
+        return jsonify({"status": "error", "message": "Token-ul si noua parola sunt obligatorii."}), 400
+
+    # FIX: Se aplica din nou politica de complexitate de la register
+    if len(new_password) < 8:
+        return jsonify({"status": "error", "message": "Noua parola trebuie sa aiba minim 8 caractere!"}), 400
+
+    try:
+        # 1. Validam ca token-ul este corect si nu a expirat
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        user_id = decoded.get('reset_user_id')
+
+        # 2. Hash-uim noua parola cu Bcrypt
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), salt).decode('utf-8')
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # 3. Updatam parola. Optional: Deblocam contul daca a fost victima unui brute force
+        cur.execute(
+            "UPDATE users SET password_hash = %s, locked = FALSE WHERE id = %s", 
+            (hashed_password, user_id)
+        )
+        conn.commit()
+
+        if cur.rowcount == 0:
+            return jsonify({"status": "error", "message": "Eroare la resetare."}), 404
+        
+        log_audit(user_id, "PASSWORD_RESET_SUCCESS", ip_address=request.remote_addr)
+
+        cur.close()
+        conn.close()
+        return jsonify({"status": "success", "message": "Parola a fost schimbata si contul deblocat!"}), 200
+
+    except jwt.ExpiredSignatureError:
+        # FIX: Token-urile vechi nu mai pot fi folosite
+        return jsonify({"status": "error", "message": "Token-ul a expirat (limita de 15 minute)."}), 401
+    except jwt.InvalidTokenError:
+        # FIX: Protectie impotriva token-urilor modificate manual (Criptografie)
+        return jsonify({"status": "error", "message": "Token invalid sau manipulat."}), 401
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Eroare server."}), 500
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

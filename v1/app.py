@@ -22,9 +22,41 @@ def get_db_connection():
         password=DB_PASS
     )
 
+@app.route('/ticket', methods=['POST'])
+def create_ticket():
+    """Endpoint vulnerabil: permite crearea unui tichet pentru user-ul logat"""
+    token = request.cookies.get('authx_session')
+    if not token:
+        return jsonify({"status": "error", "message": "Logati-va intai"}), 401
+
+    try:
+        # Decodam token-ul si luam ID-ul
+        data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        owner_id = data['user_id']
+        
+        req_data = request.get_json()
+        title = req_data.get('title')
+        description = req_data.get('description')
+        severity = req_data.get('severity', 'LOW')
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tickets (title, description, severity, owner_id) VALUES (%s, %s, %s, %s) RETURNING id",
+            (title, description, severity, owner_id)
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({"status": "success", "ticket_id": new_id}), 201
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route('/tickets/all', methods=['GET'])
 def get_all_tickets_vulnerable():
-    """VULNERABILITATE: Returneaza toate tichetele din sistem oricui e logat"""
+    """Returneaza toate tichetele din sistem oricui e logat"""
     token = request.cookies.get('authx_session')
     if not token:
         return jsonify({"status": "error", "message": "Neautorizat"}), 401
@@ -43,7 +75,7 @@ def get_all_tickets_vulnerable():
 
 @app.route('/ticket/<int:ticket_id>', methods=['GET'])
 def get_ticket_by_id_idor(ticket_id):
-    """VULNERABILITATE: IDOR Critic. Poti vedea orice tichet doar schimband ID-ul in URL"""
+    """Poti vedea orice tichet doar schimband ID-ul in URL"""
     token = request.cookies.get('authx_session')
     if not token:
         return jsonify({"status": "error", "message": "Logati-va intai"}), 401
@@ -140,7 +172,7 @@ def login():
 
         #1. cream un token JWT care expira peste 10 ani
         token = jwt.encode({
-            'user_id': user,
+            'user_id': user[0],
             'email': email,
             'exp': datetime.datetime.utcnow() + datetime.timedelta(days=3650)
         }, app.config['SECRET_KEY'], algorithm='HS256')
